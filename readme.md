@@ -22,7 +22,7 @@ The engine learns value estimation through self-play and can play against a huma
 
 ```
 project/
-├── chess_nn.py           # Main Python file
+├── main.py           # Main Python file
 ├── chess_net.pth         # Neural network weights (created after training)
 ├── assets/               # Folder containing piece images
 │   ├── wp.png
