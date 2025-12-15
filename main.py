@@ -1,224 +1,273 @@
-#AI Tic-Tac-Toe with DQN and Model Persistence
 import os
 import random
-from collections import deque
 import numpy as np
+import pygame
+import chess
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 
-MODEL_PATH = "tictactoe_dqn.pth"
+# ================= CONFIG =================
 
-# Game Environment
-class TicTacToe:
-    def __init__(self):
-        self.reset()
+BOARD_SIZE = 640
+SQUARE_SIZE = BOARD_SIZE // 8
 
-    def reset(self):
-        self.board = np.zeros(9, dtype=np.int8)
-        self.done = False
-        return self.board.copy()
+MODEL_PATH = "chess_net.pth"
 
-    def available_actions(self):
-        return [i for i in range(9) if self.board[i] == 0]
+SEARCH_DEPTH = 4
+EPOCHS = 1500
+LR = 1e-4
 
-    def check_winner(self):
-        wins = [
-            (0,1,2),(3,4,5),(6,7,8),
-            (0,3,6),(1,4,7),(2,5,8),
-            (0,4,8),(2,4,6)
-        ]
-        for a,b,c in wins:
-            if self.board[a] == self.board[b] == self.board[c] != 0:
-                return self.board[a]
-        if 0 not in self.board:
-            return 0
-        return None
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def step(self, action, player):
-        if self.board[action] != 0:
-            return self.board.copy(), -1.0, True
+WHITE = (240, 217, 181)
+BROWN = (181, 136, 99)
 
-        self.board[action] = player
-        result = self.check_winner()
+# ================= MODEL =================
 
-        if result is not None:
-            if result == player:
-                return self.board.copy(), 1.0, True
-            elif result == 0:
-                return self.board.copy(), 0.5, True
-            else:
-                return self.board.copy(), -1.0, True
-
-        return self.board.copy(), 0.0, False
-
-# Tiny Neural Network for DQN
-class DQN(nn.Module):
+class ChessNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(9, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 9)
-        )
+        self.conv1 = nn.Conv2d(12, 64, 3, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
+        self.fc1 = nn.Linear(128 * 8 * 8, 256)
+        self.fc2 = nn.Linear(256, 1)
 
     def forward(self, x):
-        return self.net(x)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return torch.tanh(self.fc2(x))
 
-# Replay Buffer (AI's Memory)
-class ReplayBuffer:
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
+# ================= ENCODING =================
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+PIECE_TO_PLANE = {
+    chess.PAWN: 0,
+    chess.KNIGHT: 1,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 4,
+    chess.KING: 5,
+}
 
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (
-            torch.tensor(states, dtype=torch.float32),
-            torch.tensor(actions, dtype=torch.int64),
-            torch.tensor(rewards, dtype=torch.float32),
-            torch.tensor(next_states, dtype=torch.float32),
-            torch.tensor(dones, dtype=torch.float32)
+def board_to_tensor(board):
+    tensor = np.zeros((12, 8, 8), dtype=np.float32)
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece:
+            plane = PIECE_TO_PLANE[piece.piece_type]
+            if piece.color == chess.BLACK:
+                plane += 6
+            r = 7 - chess.square_rank(sq)
+            c = chess.square_file(sq)
+            tensor[plane, r, c] = 1.0
+    return tensor
+
+# ================= EVALUATION =================
+
+def material_score(board):
+    values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0
+    }
+    score = 0
+    for p in values:
+        score += len(board.pieces(p, chess.WHITE)) * values[p]
+        score -= len(board.pieces(p, chess.BLACK)) * values[p]
+    return score / 39.0
+
+def evaluate(model, board):
+    t = torch.tensor(board_to_tensor(board)).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        nn_val = model(t).item()
+    return 0.7 * nn_val + 0.3 * material_score(board)
+
+# ================= SEARCH =================
+
+def minimax(board, depth, alpha, beta, maximizing, model):
+    if depth == 0 or board.is_game_over():
+        return evaluate(model, board)
+
+    if maximizing:
+        best = -1e9
+        for move in board.legal_moves:
+            board.push(move)
+            val = minimax(board, depth-1, alpha, beta, False, model)
+            board.pop()
+            best = max(best, val)
+            alpha = max(alpha, val)
+            if beta <= alpha:
+                break
+        return best
+    else:
+        best = 1e9
+        for move in board.legal_moves:
+            board.push(move)
+            val = minimax(board, depth-1, alpha, beta, True, model)
+            board.pop()
+            best = min(best, val)
+            beta = min(beta, val)
+            if beta <= alpha:
+                break
+        return best
+
+def best_move(board, model):
+    best_val = -1e9 if board.turn else 1e9
+    choice = None
+
+    for move in board.legal_moves:
+        board.push(move)
+        val = minimax(board, SEARCH_DEPTH-1, -1e9, 1e9, not board.turn, model)
+        board.pop()
+
+        if board.turn and val > best_val:
+            best_val = val
+            choice = move
+        elif not board.turn and val < best_val:
+            best_val = val
+            choice = move
+
+    return choice
+
+# ================= TRAINING =================
+
+def train_model():
+    print("Training (stabilized)...")
+
+    model = ChessNet().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=300, gamma=0.5)
+    loss_fn = nn.MSELoss()
+
+    for epoch in range(EPOCHS):
+        board = chess.Board()
+        states = []
+
+        while not board.is_game_over():
+            states.append(board_to_tensor(board))
+            board.push(random.choice(list(board.legal_moves)))
+
+        result = board.result()
+        game_value = 1.0 if result == "1-0" else -1.0 if result == "0-1" else 0.0
+
+        total_loss = 0.0
+        n = len(states)
+
+        for i, s in enumerate(states):
+            discount = (i + 1) / n
+            target_value = game_value * discount * 0.8
+
+            target = torch.tensor([[target_value]], device=DEVICE)
+            s = torch.tensor(s).unsqueeze(0).to(DEVICE)
+
+            pred = model(s)
+            loss = loss_fn(pred, target)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        avg_loss = total_loss / max(1, n)
+        lr_now = opt.param_groups[0]["lr"]
+
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"Loss: {avg_loss:.6f} | "
+            f"LR: {lr_now:.6f}"
         )
 
-    def __len__(self):
-        return len(self.buffer)
+    torch.save(model.state_dict(), MODEL_PATH)
+    print("Model saved.")
 
-# Training Function (Saves model file after training)
-def train_and_save():
-    print("Training model for the first time...")
-    env = TicTacToe()
+# ================= GUI =================
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy_net = DQN().to(device)
-    target_net = DQN().to(device)
-    target_net.load_state_dict(policy_net.state_dict())
+def load_piece_images():
+    images = {}
+    for color in ['w', 'b']:
+        for p in ['p', 'n', 'b', 'r', 'q', 'k']:
+            key = color + p
+            img = pygame.image.load(f"assets/{key}.png")
+            img = pygame.transform.smoothscale(img, (SQUARE_SIZE, SQUARE_SIZE))
+            images[key] = img
+    return images
 
-    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    buffer = ReplayBuffer()
+def draw_board(screen, board, piece_images):
+    for r in range(8):
+        for c in range(8):
+            color = WHITE if (r + c) % 2 == 0 else BROWN
+            pygame.draw.rect(
+                screen, color,
+                pygame.Rect(c*SQUARE_SIZE, r*SQUARE_SIZE, SQUARE_SIZE, SQUARE_SIZE)
+            )
 
-    GAMMA = 0.99
-    BATCH_SIZE = 64
-    EPSILON = 1.0
-    EPSILON_MIN = 0.05
-    EPSILON_DECAY = 0.995
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece:
+            c = chess.square_file(sq)
+            r = 7 - chess.square_rank(sq)
+            key = ('w' if piece.color else 'b') + piece.symbol().lower()
+            screen.blit(piece_images[key], (c*SQUARE_SIZE, r*SQUARE_SIZE))
 
-    for episode in range(6000):
-        state = env.reset()
-        done = False
+def run_game():
+    if not os.path.exists(MODEL_PATH):
+        train_model()
 
-        while not done:
-            if random.random() < EPSILON:
-                action = random.choice(env.available_actions())
-            else:
-                with torch.no_grad():
-                    q = policy_net(torch.tensor(state, dtype=torch.float32).to(device)).cpu().numpy()
-                    for i in range(9):
-                        if state[i] != 0:
-                            q[i] = -1e9
-                    action = int(np.argmax(q))
-
-            next_state, reward, done = env.step(action, 1)
-
-            if not done:
-                opp_action = random.choice(env.available_actions())
-                next_state, opp_reward, done = env.step(opp_action, -1)
-                if done and opp_reward == 1.0:
-                    reward = -1.0
-
-            buffer.push(state, action, reward, next_state, done)
-            state = next_state
-
-            if len(buffer) >= BATCH_SIZE:
-                states, actions, rewards, next_states, dones = buffer.sample(BATCH_SIZE)
-                states, actions = states.to(device), actions.to(device)
-                rewards, next_states = rewards.to(device), next_states.to(device)
-                dones = dones.to(device)
-
-                q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-                with torch.no_grad():
-                    target = rewards + GAMMA * target_net(next_states).max(1)[0] * (1 - dones)
-
-                loss = nn.MSELoss()(q_values, target)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-        EPSILON = max(EPSILON_MIN, EPSILON * EPSILON_DECAY)
-
-    torch.save(policy_net.state_dict(), MODEL_PATH)
-    print("Training complete. Model saved.")
-
-# Play Mode
-def print_board(board):
-    symbols = {1: "X", -1: "O", 0: " "}
-    c = [symbols[v] for v in board]
-    print("\n")
-    print(f" {c[0]} | {c[1]} | {c[2]} ")
-    print("---+---+---")
-    print(f" {c[3]} | {c[4]} | {c[5]} ")
-    print("---+---+---")
-    print(f" {c[6]} | {c[7]} | {c[8]} ")
-    print("\n")
-
-
-def play():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = DQN().to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model = ChessNet().to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
     model.eval()
 
-    env = TicTacToe()
-    board = env.reset()
-    done = False
+    pygame.init()
+    screen = pygame.display.set_mode((BOARD_SIZE, BOARD_SIZE))
+    pygame.display.set_caption("Neural Chess")
 
-    print("You are O. AI is X.")
-    print("Choose positions using numbers 0-8:")
-    print(" 0 | 1 | 2 ")
-    print("---+---+---")
-    print(" 3 | 4 | 5 ")
-    print("---+---+---")
-    print(" 6 | 7 | 8 \n")
+    piece_images = load_piece_images()
 
-    while not done:
-        print_board(board)
-        while True:
-            try:
-                move = int(input("Your move (0-8): "))
-                if move in env.available_actions():
-                    break
-                print("That position is already taken. Try again.")
-            except ValueError:
-                print("Please enter a number between 0 and 8.")
+    board = chess.Board()
+    selected = None
+    running = True
 
-        board, _, done = env.step(move, -1)
-        if done:
-            break
-        with torch.no_grad():
-            q = model(torch.tensor(board, dtype=torch.float32).to(device)).cpu().numpy()
-            for i in range(9):
-                if board[i] != 0:
-                    q[i] = -1e9
-            ai_move = int(np.argmax(q))
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
 
-        board, _, done = env.step(ai_move, 1)
+            if event.type == pygame.MOUSEBUTTONDOWN and board.turn:
+                x, y = pygame.mouse.get_pos()
+                c = x // SQUARE_SIZE
+                r = 7 - (y // SQUARE_SIZE)
+                sq = chess.square(c, r)
 
-    print_board(board)
-    result = env.check_winner()
-    if result == 1:
-        print("AI wins!")
-    elif result == -1:
-        print("You win!")
-    else:
-        print("It's a draw!")
+                if selected is None:
+                    selected = sq
+                else:
+                    move = chess.Move(selected, sq)
+                    if move in board.legal_moves:
+                        board.push(move)
+                    selected = None
 
-# Accesses model file; if not found, trains and saves it.
+        if not board.turn and not board.is_game_over():
+            move = best_move(board, model)
+            if move:
+                board.push(move)
+
+        draw_board(screen, board, piece_images)
+        pygame.display.flip()
+
+    pygame.quit()
+
+# ================= MAIN =================
+
 if __name__ == "__main__":
-    if not os.path.exists(MODEL_PATH):
-        train_and_save()
-    play()
+    run_game()
