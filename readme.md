@@ -1,6 +1,6 @@
 # Neural Chess Engine
 
-A Python chess engine powered by a convultational neural network (CNN) with a GUI using Pygame.  
+A Python chess engine powered by a convolutional neural network (CNN) with a GUI using Pygame.  
 The engine learns value estimation through self-play and can play against a human in real-time.
 
 ---
